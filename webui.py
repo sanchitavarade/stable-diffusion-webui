@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import time
+import asyncio
+from threading import Thread
 
 from modules import timer
 from modules import initialize_util
@@ -11,9 +13,97 @@ startup_timer = timer.startup_timer
 startup_timer.record("launcher")
 
 initialize.imports()
-
 initialize.check_versions()
 
+
+# ------------------- NEW FEATURES -------------------
+
+def add_healthcheck(app):
+    """Add /health and /metrics endpoints"""
+    from fastapi import APIRouter
+    import psutil
+
+    router = APIRouter()
+
+    @router.get("/health")
+    def health():
+        return {"status": "ok", "uptime": time.time() - startup_timer.start_time}
+
+    @router.get("/metrics")
+    def metrics():
+        return {
+            "cpu_percent": psutil.cpu_percent(),
+            "memory": psutil.virtual_memory()._asdict(),
+            "uptime": time.time() - startup_timer.start_time,
+        }
+
+    app.include_router(router)
+
+
+def reload_config():
+    """Reload configuration without restarting the server"""
+    from modules import shared
+    shared.opts.reload()
+    print("✅ Configuration reloaded without full restart.")
+
+
+def background_scheduler():
+    """Run periodic background jobs"""
+    import schedule
+    from modules import ui_tempdir
+
+    def job():
+        print("🧹 Cleaning temporary files...")
+        ui_tempdir.cleanup_tmpdr()
+
+    schedule.every(1).hours.do(job)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
+
+
+def start_scheduler():
+    t = Thread(target=background_scheduler, daemon=True)
+    t.start()
+
+
+def add_control_endpoints(app):
+    """Expose REST API for server control"""
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    @router.post("/control/{action}")
+    def control(action: str):
+        from modules import shared
+        if action in ("stop", "restart"):
+            shared.state.set_server_command(action)
+            return {"message": f"Server {action} triggered."}
+        elif action == "reload_config":
+            reload_config()
+            return {"message": "Config reloaded."}
+        return {"error": "Invalid action."}
+
+    app.include_router(router)
+
+
+def add_websocket(app):
+    """Expose websocket for server notifications"""
+    from fastapi import WebSocket
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(ws: WebSocket):
+        await ws.accept()
+        await ws.send_text("Connected to server 🚀")
+        while True:
+            await ws.send_text(
+                f"Server running. Uptime: {time.time() - startup_timer.start_time:.2f}s"
+            )
+            await asyncio.sleep(5)
+
+
+# ------------------- CORE APP -------------------
 
 def create_api(app):
     from modules.api.api import Api
@@ -28,10 +118,16 @@ def api_only():
     from modules.shared_cmd_options import cmd_opts
 
     initialize.initialize()
+    start_scheduler()
 
     app = FastAPI()
     initialize_util.setup_middleware(app)
     api = create_api(app)
+
+    # New features
+    add_healthcheck(app)
+    add_control_endpoints(app)
+    add_websocket(app)
 
     from modules import script_callbacks
     script_callbacks.before_ui_callback()
@@ -50,6 +146,7 @@ def webui():
 
     launch_api = cmd_opts.api
     initialize.initialize()
+    start_scheduler()
 
     from modules import shared, ui_tempdir, script_callbacks, ui, progress, ui_extra_networks
 
@@ -97,22 +194,21 @@ def webui():
 
         startup_timer.record("gradio launch")
 
-        # gradio uses a very open CORS policy via app.user_middleware, which makes it possible for
-        # an attacker to trick the user into opening a malicious HTML page, which makes a request to the
-        # running web ui and do whatever the attacker wants, including installing an extension and
-        # running its code. We disable this here. Suggested by RyotaK.
         app.user_middleware = [x for x in app.user_middleware if x.cls.__name__ != 'CORSMiddleware']
-
         initialize_util.setup_middleware(app)
 
         progress.setup_progress_api(app)
         ui.setup_ui_api(app)
 
+        # New features
+        add_healthcheck(app)
+        add_control_endpoints(app)
+        add_websocket(app)
+
         if launch_api:
             create_api(app)
 
         ui_extra_networks.add_pages_to_demo(app)
-
         startup_timer.record("add APIs")
 
         with startup_timer.subcategory("app_started_callback"):
@@ -127,6 +223,8 @@ def webui():
                 if server_command:
                     if server_command in ("stop", "restart"):
                         break
+                    elif server_command == "reload_config":
+                        reload_config()
                     else:
                         print(f"Unknown server command: {server_command}")
         except KeyboardInterrupt:
@@ -135,11 +233,9 @@ def webui():
 
         if server_command == "stop":
             print("Stopping server...")
-            # If we catch a keyboard interrupt, we want to stop the server and exit.
             shared.demo.close()
             break
 
-        # disable auto launch webui in browser for subsequent UI Reload
         os.environ.setdefault('SD_WEBUI_RESTARTING', '1')
 
         print('Restarting UI...')
